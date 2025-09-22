@@ -242,6 +242,7 @@
 
 -record(state, {
           name            :: atom(),
+          broker_name     :: binary(),
           owner           :: undefined | pid(),
           msg_handler     :: ?NO_HANDLER | msg_handler(),
           host            :: host(),
@@ -819,6 +820,8 @@ init([], State) ->
     State;
 init([{name, Name} | Opts], State) ->
     init(Opts, State#state{name = Name});
+init([{broker_name, Name} | Opts], State) ->
+    init(Opts, State#state{broker_name = Name});
 init([{owner, Owner} | Opts], State) when is_pid(Owner) ->
     link(Owner),
     init(Opts, State#state{owner = Owner});
@@ -2843,15 +2846,17 @@ calculate_data_size(Data) when is_binary(Data) ->
 calculate_data_size(Data) ->
     iolist_size(Data).
 
-telemetry_metadata(Data, #state{clientid = ClientId, socket = Socket, conn_mod = ConnMod, proto_ver = ProtoVer}) ->
-    #{
-        client_id => ClientId,
-        data => Data,
-        socket_type => socket_type(Socket),
-        connection_module => ConnMod,
-        protocol_version => ProtoVer,
-        pid => self()
-    }.
+telemetry_metadata(Data, #state{clientid = ClientId, broker_name = BrokerName, 
+    socket = Socket, conn_mod = ConnMod, proto_ver = ProtoVer}) ->
+        #{
+            client_id => ClientId,
+            data => Data,
+            socket_type => socket_type(Socket),
+            connection_module => ConnMod,
+            protocol_version => ProtoVer,
+            broker_name => BrokerName,
+            pid => self()
+        }.
 
 -spec socket_type(term()) -> atom().
 socket_type({ConnPid, _StreamRef}) when is_pid(ConnPid) ->
