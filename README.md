@@ -400,6 +400,8 @@ option() = {name, atom()} |
            {low_mem, boolean()} |
            {reconnect, infinity | non_neg_integer()} |
            {reconnect_timeout, pos_integer()} |
+           {telemetry, boolean()} |
+           {schedule_publish, map()} |
            {properties, properties()} |
            {custom_auth_callbacks, map()}
 ```
@@ -651,6 +653,20 @@ Properties of CONNECT packet.
 This configuration option enables enhanced authentication mechanisms in MQTT v5 by specifying custom callback functions.
 
 See [Enhanced Authentication](#EnhancedAuthentication) below for more details.
+
+`{schedule_publish, Config}`
+
+Configure a built-in scheduler that periodically publishes messages after the client receives a successful CONNACK. `Config` is a map with the following keys:
+
+- `enabled` (boolean, default `false`): turn the scheduler on.
+- `mfa` (fun/MFA, required when enabled): callback that returns the payload for each tick. It may return a `#mqtt_msg{}` record, `{Topic, Payload}`, `{Topic, Props, Payload, Opts}`, or `skip` to suppress the current tick.
+- `interval_ms` (positive integer, default `1000`): period between ticks in milliseconds.
+- `jitter_ms` (non-negative integer, default `0`): maximum start jitter applied once after connect.
+- `jitter_mode` (`uniform` | `fixed`, default `uniform`): `uniform` chooses a random delay between `0` and `jitter_ms`; `fixed` waits exactly `jitter_ms`.
+- `via` (via(), default `default`): publish over a specific transport path when using QUIC streams.
+- `timeout` (non-negative integer or `infinity`, default `infinity`): per-message timeout passed to `publish_async/7`.
+
+The scheduler is cancelled automatically on disconnect/reconnect and restarted after the next successful connection.
 
 **emqtt:connect(Client) -> {ok, Properties} | {error, Reason}**
 

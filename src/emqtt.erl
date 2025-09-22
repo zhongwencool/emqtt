@@ -133,6 +133,16 @@
 
 -type(mfas() :: {module(), atom(), list()} | {function(), list()}).
 
+-type(schedule_publish_option() :: #{
+          enabled => boolean(),
+          mfa => mfas(),
+          interval_ms => pos_integer(),
+          jitter_ms => non_neg_integer(),
+          jitter_mode => uniform | fixed,
+          via => via(),
+          timeout => non_neg_integer() | infinity
+         }).
+
 %% Message handler is a set of callbacks defined to handle MQTT messages
 %% as well as the disconnect event.
 -type(msg_handler() :: #{publish => fun((_Publish :: map()) -> any()) | mfas(),
@@ -176,6 +186,7 @@
                 | {with_qoe_metrics, boolean()}
                 | {properties, properties()}
                 | {telemetry, boolean()}
+                | {schedule_publish, schedule_publish_option() | map()}
                 | {nst,  binary()} %% @deprecated 1.13.1
                 | {custom_auth_callbacks, custom_auth_callbacks()}).
 
@@ -279,7 +290,16 @@
           nst             :: undefined | binary(), %% quic new session ticket
           pendings        :: pendings(),
           extra = #{}     :: map(), %% extra field for easier to make appup
-          telemetry_enabled :: boolean()
+          telemetry_enabled :: boolean(),
+          schedule_enabled :: boolean(),
+          schedule_mfa :: mfas() | undefined,
+          schedule_interval_ms :: pos_integer() | undefined,
+          schedule_jitter_ms :: non_neg_integer(),
+          schedule_jitter_mode :: uniform | fixed,
+          schedule_via :: via(),
+          schedule_timeout :: non_neg_integer() | infinity,
+          schedule_start_timer :: tref() | undefined,
+          schedule_tick_timer :: tref() | undefined
          }). %% note, always add the new fields at the tail for code_change.
 
 -type(state() ::  #state{}).
@@ -770,7 +790,16 @@ init([Options]) ->
                           qoe             = false,
                           last_packet_id  = 1,
                           pendings        = queue:new(),
-                          telemetry_enabled = false
+                          telemetry_enabled = false,
+                          schedule_enabled = false,
+                          schedule_mfa = undefined,
+                          schedule_interval_ms = undefined,
+                          schedule_jitter_ms = 0,
+                          schedule_jitter_mode = uniform,
+                          schedule_via = default,
+                          schedule_timeout = infinity,
+                          schedule_start_timer = undefined,
+                          schedule_tick_timer = undefined
                          })),
     {ok, initialized, init_parse_state(State)}.
 
@@ -911,6 +940,9 @@ init([{nst, Ticket} | Opts], State = #state{sock_opts = SockOpts}) when is_binar
     init(Opts, State#state{sock_opts = [{nst, Ticket} | SockOpts]});
 init([{with_qoe_metrics, IsReportQoE} | Opts], State) when is_boolean(IsReportQoE) ->
     init(Opts, State#state{qoe = IsReportQoE});
+init([{schedule_publish, Config} | Opts], State) ->
+    State1 = init_schedule_publish(Config, State),
+    init(Opts, State1);
 init([{custom_auth_callbacks, #{init := InitFn,
                                 handle_auth := HandleAuthFn
                                }} | Opts], State) ->
@@ -932,6 +964,89 @@ init([{custom_auth_callbacks, #{init := InitFn,
     init(Opts, State#state{extra = Extra});
 init([_Opt | Opts], State) ->
     init(Opts, State).
+
+init_schedule_publish(Config, State) when is_map(Config) ->
+    Enabled = maps:get(enabled, Config, false),
+    case Enabled of
+        true ->
+            _ = cancel_timer(State#state.schedule_start_timer),
+            _ = cancel_timer(State#state.schedule_tick_timer),
+            MFA = get_required(mfa, Config),
+            ok = validate_schedule_mfa(MFA),
+            Interval = maps:get(interval_ms, Config, 1000),
+            ok = validate_positive_integer(interval_ms, Interval),
+            Jitter = maps:get(jitter_ms, Config, 0),
+            ok = validate_non_negative_integer(jitter_ms, Jitter),
+            Mode = maps:get(jitter_mode, Config, uniform),
+            ok = validate_jitter_mode(Mode),
+            Via = maps:get(via, Config, default),
+            Timeout = maps:get(timeout, Config, infinity),
+            ok = validate_timeout(Timeout),
+            State#state{
+              schedule_enabled = true,
+              schedule_mfa = MFA,
+              schedule_interval_ms = Interval,
+              schedule_jitter_ms = Jitter,
+              schedule_jitter_mode = Mode,
+              schedule_via = Via,
+              schedule_timeout = Timeout,
+              schedule_start_timer = undefined,
+              schedule_tick_timer = undefined
+             };
+        false ->
+            init_schedule_publish_disabled(State)
+    end;
+init_schedule_publish(_Other, _State) ->
+    erlang:error({invalid_schedule_publish_config, not_a_map}).
+
+init_schedule_publish_disabled(State) ->
+    _ = cancel_timer(State#state.schedule_start_timer),
+    _ = cancel_timer(State#state.schedule_tick_timer),
+    State#state{
+      schedule_enabled = false,
+      schedule_mfa = undefined,
+      schedule_interval_ms = undefined,
+      schedule_jitter_ms = 0,
+      schedule_jitter_mode = uniform,
+      schedule_via = default,
+      schedule_timeout = infinity,
+      schedule_start_timer = undefined,
+      schedule_tick_timer = undefined
+     }.
+
+get_required(Key, Map) ->
+    case maps:find(Key, Map) of
+        {ok, Value} -> Value;
+        error -> erlang:error({invalid_schedule_publish_config, {missing_key, Key}})
+    end.
+
+validate_schedule_mfa(F) when is_function(F) ->
+    case erlang:fun_info(F, arity) of
+        {arity, 0} -> ok;
+        {arity, N} -> erlang:error({invalid_schedule_publish_config, {invalid_fun_arity, N}})
+    end;
+validate_schedule_mfa({F, A}) when is_function(F), is_list(A) -> ok;
+validate_schedule_mfa({M, F, A}) when is_atom(M), is_atom(F), is_list(A) -> ok;
+validate_schedule_mfa(_Other) ->
+    erlang:error({invalid_schedule_publish_config, invalid_mfa}).
+
+validate_positive_integer(_Key, Value) when is_integer(Value), Value > 0 -> ok;
+validate_positive_integer(Key, Value) ->
+    erlang:error({invalid_schedule_publish_config, {invalid_value, Key, Value}}).
+
+validate_non_negative_integer(_Key, Value) when is_integer(Value), Value >= 0 -> ok;
+validate_non_negative_integer(Key, Value) ->
+    erlang:error({invalid_schedule_publish_config, {invalid_value, Key, Value}}).
+
+validate_jitter_mode(uniform) -> ok;
+validate_jitter_mode(fixed) -> ok;
+validate_jitter_mode(Other) ->
+    erlang:error({invalid_schedule_publish_config, {invalid_value, jitter_mode, Other}}).
+
+validate_timeout(infinity) -> ok;
+validate_timeout(Value) when is_integer(Value), Value >= 0 -> ok;
+validate_timeout(Value) ->
+    erlang:error({invalid_schedule_publish_config, {invalid_value, timeout, Value}}).
 
 maybe_no_will(#mqtt_msg{topic = T} = W) when is_binary(T) andalso T =/= <<>> ->
     W;
@@ -1164,7 +1279,7 @@ waiting_for_connack(cast, {?CONNACK_PACKET(?RC_SUCCESS,
     %% (see `connected(info, immediate_retry, ...)` below).
     ReceiveMaximum = maps:get('Receive-Maximum', AllProps1, infinity),
     Inflight1 = emqtt_inflight:limit(ReceiveMaximum, Inflight),
-    State4 = State3#state{inflight = Inflight1},
+    State4 = maybe_start_schedule_timer(State3#state{inflight = Inflight1}),
     Retry = [{next_event, info, immediate_retry} || not emqtt_inflight:is_empty(Inflight1)],
     case take_call(call_id(connect, Via), State4) of
         {value, #call{from = From}, State5} ->
@@ -1422,6 +1537,24 @@ connected(cast, {?PACKET(?PINGRESP), Via}, State) ->
 connected(cast, {?DISCONNECT_PACKET(ReasonCode, Properties), _Via}, State) ->
     maybe_reconnect({disconnected, ReasonCode, Properties}, State);
 
+connected(info, {timeout, TRef, schedule_start},
+          #state{schedule_start_timer = TRef} = State0) ->
+    State1 = State0#state{schedule_start_timer = undefined},
+    State2 = schedule_fire_tick(State1),
+    {keep_state, ensure_schedule_tick_timer(State2)};
+
+connected(info, {timeout, _TRef, schedule_start}, State) ->
+    {keep_state, State};
+
+connected(info, {timeout, TRef, schedule_tick},
+          #state{schedule_tick_timer = TRef} = State0) ->
+    State1 = State0#state{schedule_tick_timer = undefined},
+    State2 = schedule_fire_tick(State1),
+    {keep_state, ensure_schedule_tick_timer(State2)};
+
+connected(info, {timeout, _TRef, schedule_tick}, State) ->
+    {keep_state, State};
+
 connected(info, {timeout, _TRef, keepalive}, State = #state{force_ping = true, low_mem = IsLowMem}) ->
     case ensure_pingresp_received(State) of
         ok ->
@@ -1530,6 +1663,12 @@ handle_event({call, From}, stop, _StateName, _State) ->
 
 handle_event({call, From}, status, StateName, _State) ->
     {keep_state_and_data, {reply, From, StateName}};
+
+handle_event(info, {timeout, _TRef, schedule_start}, _StateName, State) ->
+    {keep_state, State};
+
+handle_event(info, {timeout, _TRef, schedule_tick}, _StateName, State) ->
+    {keep_state, State};
 
 handle_event(info, {gun_ws, ConnPid, StreamRef, {binary, Data}},
              _StateName, State = #state{socket = {ConnPid, StreamRef}}) ->
@@ -1695,6 +1834,8 @@ terminate(Reason, _StateName, State = #state{conn_mod = ConnMod, socket = Socket
     ok = reply_all_inflight_reqs(Reason1, State),
     ok = reply_all_pendings_reqs(Reason1, State),
     ok = eval_msg_handler(State, disconnected, Reason1),
+    ok = cancel_timer(State#state.schedule_start_timer),
+    ok = cancel_timer(State#state.schedule_tick_timer),
     ok = close_socket(ConnMod, Socket).
 
 %% Downgrade
@@ -1964,6 +2105,111 @@ ensure_keepalive_timer(State = #state{keepalive = I}) ->
     ensure_keepalive_timer(timer:seconds(I), State).
 ensure_keepalive_timer(I, State) when is_integer(I) ->
     State#state{keepalive_timer = erlang:start_timer(I, self(), keepalive)}.
+
+maybe_start_schedule_timer(State = #state{schedule_enabled = true,
+                                          schedule_start_timer = undefined,
+                                          schedule_interval_ms = Interval,
+                                          schedule_jitter_ms = Jitter,
+                                          schedule_jitter_mode = Mode})
+  when is_integer(Interval), Interval > 0, is_integer(Jitter), Jitter >= 0 ->
+    Delay = schedule_initial_delay(Jitter, Mode),
+    TRef = erlang:start_timer(Delay, self(), schedule_start),
+    State#state{schedule_start_timer = TRef};
+maybe_start_schedule_timer(State) ->
+    State.
+
+schedule_initial_delay(Jitter, fixed) when Jitter =< 0 -> 0;
+schedule_initial_delay(Jitter, fixed) -> Jitter;
+schedule_initial_delay(0, _Mode) -> 0;
+schedule_initial_delay(Jitter, uniform) when Jitter > 0 ->
+    %% rand:uniform(N) returns 1..N, so subtract 1 to get 0..N-1
+    rand:uniform(Jitter + 1) - 1;
+schedule_initial_delay(_, _) -> 0.
+
+ensure_schedule_tick_timer(State = #state{schedule_enabled = true,
+                                          schedule_interval_ms = Interval})
+  when is_integer(Interval), Interval > 0 ->
+    TRef = erlang:start_timer(Interval, self(), schedule_tick),
+    State#state{schedule_tick_timer = TRef};
+ensure_schedule_tick_timer(State) ->
+    State.
+
+schedule_fire_tick(State = #state{schedule_enabled = true,
+                                  schedule_mfa = MFA}) when MFA =/= undefined ->
+    case schedule_safe_apply_mfa(MFA) of
+        skip ->
+            State;
+        {error, Reason, Stack} ->
+            ?LOG(error, "schedule_publish_mfa_failed", #{reason => Reason, stacktrace => Stack}, State),
+            State;
+        {ok, Value} ->
+            schedule_dispatch(Value, State)
+    end;
+schedule_fire_tick(State) ->
+    State.
+
+schedule_safe_apply_mfa(MFA) ->
+    try
+        case apply_schedule_mfa(MFA) of
+            skip -> skip;
+            Value -> {ok, Value}
+        end
+    catch
+        Class:Reason:Stacktrace ->
+            {error, {Class, Reason}, Stacktrace}
+    end.
+
+apply_schedule_mfa(F) when is_function(F, 0) ->
+    erlang:apply(F, []);
+apply_schedule_mfa({F, A}) when is_function(F), is_list(A) ->
+    erlang:apply(F, A);
+apply_schedule_mfa({M, F, A}) when is_atom(M), is_atom(F), is_list(A) ->
+    erlang:apply(M, F, A);
+apply_schedule_mfa(F) when is_function(F) ->
+    %% support anonymous funs with arbitrary arity via apply
+    Arity = erlang:fun_info(F, arity),
+    case Arity of
+        {arity, 0} -> erlang:apply(F, []);
+        {arity, N} when N > 0 ->
+            erlang:error({invalid_schedule_publish_config, {invalid_fun_arity, N}})
+    end.
+
+schedule_dispatch(#mqtt_msg{} = Msg,
+                  State = #state{schedule_via = Via,
+                                 schedule_timeout = Timeout}) ->
+    _ = publish_async(self(), Via, Msg, Timeout, ?NO_HANDLER),
+    State;
+schedule_dispatch({Topic, Payload},
+                  State = #state{schedule_via = Via,
+                                 schedule_timeout = Timeout}) ->
+    try
+        BinTopic = iolist_to_binary(Topic),
+        _ = publish_async(self(), Via, BinTopic, #{}, Payload, [{qos, ?QOS_0}], Timeout, ?NO_HANDLER),
+        State
+    catch
+        Class:Reason:Stacktrace ->
+            ?LOG(error, "schedule_publish_invalid_return",
+                 #{reason => {Class, Reason}, stacktrace => Stacktrace, value => {Topic, Payload}}, State),
+            State
+    end;
+schedule_dispatch({Topic, Props, Payload, Opts},
+                  State = #state{schedule_via = Via,
+                                 schedule_timeout = Timeout})
+  when is_map(Props), is_list(Opts) ->
+    try
+        BinTopic = iolist_to_binary(Topic),
+        _ = publish_async(self(), Via, BinTopic, Props, Payload, Opts, Timeout, ?NO_HANDLER),
+        State
+    catch
+        Class:Reason:Stacktrace ->
+            ?LOG(error, "schedule_publish_invalid_return",
+                 #{reason => {Class, Reason}, stacktrace => Stacktrace,
+                   value => {Topic, Props, Payload, Opts}}, State),
+            State
+    end;
+schedule_dispatch(Other, State) ->
+    ?LOG(error, "schedule_publish_invalid_return", #{value => Other}, State),
+    State.
 
 new_call(Id, From) ->
     new_call(Id, From, undefined).
@@ -2368,6 +2614,8 @@ prepare_reconnect(#state{
         keepalive_timer = KeepAliveTimer,
         sock_opts = OldSockOpts,
         ack_timer = AckTimer,
+        schedule_start_timer = ScheduleStartTimer,
+        schedule_tick_timer = ScheduleTickTimer,
         socket = OldSocket,
         conn_mod = ConnMod
     } = State) ->
@@ -2375,11 +2623,15 @@ prepare_reconnect(#state{
     ok = cancel_timer(RetryTimer),
     ok = cancel_timer(KeepAliveTimer),
     ok = cancel_timer(AckTimer),
+    ok = cancel_timer(ScheduleStartTimer),
+    ok = cancel_timer(ScheduleTickTimer),
     State1 = update_for_reconnecting(State),
     State1#state{
         sock_opts = proplists:delete(handle, OldSockOpts),
         retry_timer = undefined,
-        keepalive_timer = undefined
+        keepalive_timer = undefined,
+        schedule_start_timer = undefined,
+        schedule_tick_timer = undefined
     }.
 
 next_retry_cnt(infinity) -> infinity;
