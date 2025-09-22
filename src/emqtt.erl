@@ -175,6 +175,7 @@
                 | {reconnect_timeout, pos_integer()}
                 | {with_qoe_metrics, boolean()}
                 | {properties, properties()}
+                | {telemetry, boolean()}
                 | {nst,  binary()} %% @deprecated 1.13.1
                 | {custom_auth_callbacks, custom_auth_callbacks()}).
 
@@ -277,7 +278,8 @@
           qoe             :: boolean() | map(),
           nst             :: undefined | binary(), %% quic new session ticket
           pendings        :: pendings(),
-          extra = #{}     :: map() %% extra field for easier to make appup
+          extra = #{}     :: map(), %% extra field for easier to make appup
+          telemetry_enabled :: boolean()
          }). %% note, always add the new fields at the tail for code_change.
 
 -type(state() ::  #state{}).
@@ -767,7 +769,8 @@ init([Options]) ->
                           reconnect_timeout = ?DEFAULT_RECONNECT_TIMEOUT,
                           qoe             = false,
                           last_packet_id  = 1,
-                          pendings        = queue:new()
+                          pendings        = queue:new(),
+                          telemetry_enabled = false
                          })),
     {ok, initialized, init_parse_state(State)}.
 
@@ -874,6 +877,10 @@ init([{force_ping, ForcePing} | Opts], State) when is_boolean(ForcePing) ->
     init(Opts, State#state{force_ping = ForcePing});
 init([{properties, Properties} | Opts], State = #state{properties = InitProps}) ->
     init(Opts, State#state{properties = maps:merge(InitProps, Properties)});
+init([{telemetry, TelemetryFlag} | Opts], State) when is_boolean(TelemetryFlag) ->
+    init(Opts, State#state{telemetry_enabled = TelemetryFlag});
+init([{telemetry, _Other} | Opts], State) ->
+    init(Opts, State);
 init([{max_inflight, infinity} | Opts], State) ->
     init(Opts, State#state{inflight = emqtt_inflight:new(infinity)});
 init([{max_inflight, I} | Opts], State) when is_integer(I) ->
@@ -1526,7 +1533,11 @@ handle_event({call, From}, status, StateName, _State) ->
 
 handle_event(info, {gun_ws, ConnPid, StreamRef, {binary, Data}},
              _StateName, State = #state{socket = {ConnPid, StreamRef}}) ->
-    ?LOG(debug, "websocket_recv_data", #{data => Data}, State),
+    maybe_emit_telemetry_event(
+      [emqtt, websocket, recv_data],
+      fun() -> calculate_data_size(Data) end,
+      fun() -> Data end,
+      State),
     process_incoming(iolist_to_binary(Data), [], State);
 
 handle_event(info, {gun_ws, ConnPid, StreamRef, {close, Code, _}},
@@ -1546,7 +1557,11 @@ handle_event(info, {ssl, session_ticket, _Ticket}, _StateName, _State) ->
 
 handle_event(info, {TcpOrSsL, _Sock, Data}, _StateName, State)
         when TcpOrSsL =:= tcp; TcpOrSsL =:= ssl ->
-    ?LOG(debug, "recv_data", #{data => Data}, State),
+    maybe_emit_telemetry_event(
+      [emqtt, socket, recv_data],
+      fun() -> calculate_data_size(Data) end,
+      fun() -> Data end,
+      State),
     process_incoming(Data, [], run_sock(State));
 
 handle_event(info, {Error, Sock, Reason}, connected, #state{socket = Sock} = State)
@@ -2224,10 +2239,19 @@ send(Sock, Packet, State = #state{conn_mod = ConnMod, proto_ver = Ver})
     Data = emqtt_frame:serialize(Packet, Ver),
     case ConnMod:send(Sock, Data) of
         ok  ->
-            ?LOG(debug, "send_data", #{packet => redact_packet(Packet), socket => Sock}, State),
+            maybe_emit_telemetry_event(
+              [emqtt, socket, send_data],
+              fun() -> calculate_data_size(Data) end,
+              fun() -> redact_packet(Packet) end,
+              State),
             {ok, bump_last_packet_id(State)};
         {error, Reason} ->
-            ?LOG(debug, "send_data_failed", #{reason => Reason, packet => redact_packet(Packet), socket => Sock}, State),
+            maybe_emit_telemetry_event(
+              [emqtt, socket, send_data_failed],
+              fun() -> calculate_data_size(Data) end,
+              fun() -> redact_packet(Packet) end,
+              State,
+              fun() -> #{reason => Reason} end),
             {error, Reason}
     end.
 
@@ -2526,3 +2550,65 @@ maybe_qoe_tcp(#state{qoe = false} = S) ->
     S;
 maybe_qoe_tcp(#state{qoe = QoE} = S) when is_map(QoE) ->
     S#state{qoe = QoE#{tcp_connected_at => get(tcp_connected_at)}}.
+
+%% Telemetry helper functions
+maybe_emit_telemetry_event(EventName, DataSizeFun, DataFun, State) ->
+    maybe_emit_telemetry_event(EventName, DataSizeFun, DataFun, State,
+                               fun telemetry_empty_extra/0).
+
+maybe_emit_telemetry_event(_EventName, _DataSizeFun, _DataFun,
+                           #state{telemetry_enabled = false}, _ExtraFun) ->
+    ok;
+maybe_emit_telemetry_event(EventName, DataSizeFun, DataFun,
+                           State = #state{telemetry_enabled = true}, ExtraFun)
+    when is_function(DataSizeFun, 0),
+         is_function(DataFun, 0),
+         is_function(ExtraFun, 0) ->
+    DataSize = DataSizeFun(),
+    Data = DataFun(),
+    ExtraMetadata = ExtraFun(),
+    emit_telemetry_event(EventName, DataSize, Data, State, ExtraMetadata).
+
+emit_telemetry_event(EventName, DataSize, Data, State, ExtraMetadata) ->
+    Measurements = #{data_size => DataSize},
+    Metadata = telemetry_merge_metadata(Data, State, ExtraMetadata),
+    try
+        telemetry:execute(EventName, Measurements, Metadata)
+    catch
+        _:_ -> ok
+    end.
+
+telemetry_merge_metadata(Data, State, ExtraMetadata) ->
+    case ExtraMetadata of
+        Map when is_map(Map) -> maps:merge(telemetry_metadata(Data, State), Map);
+        _ -> telemetry_metadata(Data, State)
+    end.
+
+telemetry_empty_extra() -> #{}.
+
+calculate_data_size(Data) when is_binary(Data) ->
+    byte_size(Data);
+calculate_data_size(Data) ->
+    iolist_size(Data).
+
+telemetry_metadata(Data, #state{clientid = ClientId, socket = Socket, conn_mod = ConnMod, proto_ver = ProtoVer}) ->
+    #{
+        client_id => ClientId,
+        data => Data,
+        socket_type => socket_type(Socket),
+        connection_module => ConnMod,
+        protocol_version => ProtoVer,
+        pid => self()
+    }.
+
+-spec socket_type(term()) -> atom().
+socket_type({ConnPid, _StreamRef}) when is_pid(ConnPid) ->
+    websocket;
+socket_type(#ssl_socket{}) ->
+    ssl;
+socket_type({quic, _, _}) ->
+    quic;
+socket_type(Socket) when is_port(Socket) ->
+    tcp;
+socket_type(_) ->
+    unknown.
