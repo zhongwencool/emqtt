@@ -91,6 +91,7 @@ groups() ->
        t_reconnect_stop,
        t_reconnect_reach_max_attempts,
        t_reconnect_immediate_retry,
+       t_auto_subscribe_on_reconnect,
        t_subscriptions,
        t_info,
        t_stop,
@@ -570,6 +571,58 @@ test_reconnect_immediate_retry(Config) ->
                   {2, {ok, _}},
                   {3, {ok, _}},
                   {4, {ok, _}}], ?COLLECT_ASYNC_RESULT(C)),
+
+    ok = emqtt:disconnect(C).
+
+t_auto_subscribe_on_reconnect(Config) ->
+    ConnFun = ?config(conn_fun, Config),
+    case ConnFun of
+        quic_connect ->
+            ct:pal("skipped for QUIC", []),
+            ok;
+        _ ->
+            test_auto_subscribe_on_reconnect(Config)
+    end.
+
+test_auto_subscribe_on_reconnect(Config) ->
+    ConnFun = ?config(conn_fun, Config),
+    Port = ?config(port, Config),
+    Topics = [<<"auto/test/1">>, <<"auto/test/2">>],
+
+    %% Start client with auto_subscribe enabled
+    {ok, C} = emqtt:start_link([{port, Port},
+                                {reconnect, true},
+                                {auto_subscribe, true},
+                                {clean_start, false},
+                                {reconnect_timeout, 1}]),
+    {ok, _} = emqtt:ConnFun(C),
+
+    %% Subscribe to test topics
+    lists:foreach(fun(Topic) ->
+        {ok, _, _} = emqtt:subscribe(C, Topic, 1)
+    end, Topics),
+
+    %% Verify subscriptions exist
+    Subs = emqtt:subscriptions(C),
+    ?assertEqual(2, maps:size(Subs)),
+
+    %% Simulate network interruption
+    ok = emqtt_test_lib:stop_emqx(),
+    timer:sleep(100),
+    ok = emqtt_test_lib:start_emqx(),
+
+    %% Wait for reconnection and auto-resubscribe
+    timer:sleep(3000),
+
+    %% Verify client is still connected and subscriptions are restored
+    ?assertEqual(connected, emqtt:status(C)),
+    SubsAfterReconnect = emqtt:subscriptions(C),
+    ?assertEqual(2, maps:size(SubsAfterReconnect)),
+
+    %% Test that messages can be received on auto-resubscribed topics
+    lists:foreach(fun(Topic) ->
+        ok = emqtt:publish(C, Topic, <<"test_message">>, 0)
+    end, Topics),
 
     ok = emqtt:disconnect(C).
 

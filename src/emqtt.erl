@@ -183,6 +183,7 @@
                 | {low_mem, boolean()}
                 | {reconnect, reconnect()}
                 | {reconnect_timeout, pos_integer()}
+                | {auto_subscribe, boolean()}
                 | {with_qoe_metrics, boolean()}
                 | {properties, properties()}
                 | {telemetry, boolean()}
@@ -287,6 +288,7 @@
           parse_state     :: undefined | emqtt_frame:parse_state(),
           reconnect       :: reconnect(),
           reconnect_timeout :: pos_integer(),
+          auto_subscribe  :: boolean(),
           qoe             :: boolean() | map(),
           nst             :: undefined | binary(), %% quic new session ticket
           pendings        :: pendings(),
@@ -788,6 +790,7 @@ init([Options]) ->
                           low_mem         = false,
                           reconnect         = 0,
                           reconnect_timeout = ?DEFAULT_RECONNECT_TIMEOUT,
+                          auto_subscribe  = false,
                           qoe             = false,
                           last_packet_id  = 1,
                           pendings        = queue:new(),
@@ -937,6 +940,8 @@ init([{reconnect, Reconnect} | Opts], State)
     init(Opts, State#state{reconnect = Reconnect});
 init([{reconnect_timeout, I} | Opts], State) ->
     init(Opts, State#state{reconnect_timeout = timer:seconds(I)});
+init([{auto_subscribe, AutoSub} | Opts], State) when is_boolean(AutoSub) ->
+    init(Opts, State#state{auto_subscribe = AutoSub});
 init([{low_mem, IsLow} | Opts], State) when is_boolean(IsLow) ->
     init(Opts, State#state{low_mem = IsLow});
 init([{nst, Ticket} | Opts], State = #state{sock_opts = SockOpts}) when is_binary(Ticket) ->
@@ -1288,9 +1293,10 @@ waiting_for_connack(cast, {?CONNACK_PACKET(?RC_SUCCESS,
         {value, #call{from = From}, State5} ->
             {next_state, connected, State5, [{reply, From, Reply} | Retry]};
         false ->
-            %% unkown caller, internally initiated re-connect
+            %% unknown caller, internally initiated re-connect
             ok = eval_msg_handler(State4, connected, Properties),
-            {next_state, connected, State4, Retry}
+            State6 = maybe_auto_resubscribe(State4),
+            {next_state, connected, State6, Retry}
     end;
 
 waiting_for_connack(cast, {?CONNACK_PACKET(ReasonCode,
@@ -2872,3 +2878,25 @@ socket_type(Socket) when is_port(Socket) ->
     tcp;
 socket_type(_) ->
     unknown.
+
+%% @doc Auto-resubscribe to previously subscribed topics after reconnection
+%% if auto_subscribe is enabled
+-spec maybe_auto_resubscribe(state()) -> state().
+maybe_auto_resubscribe(#state{auto_subscribe = false} = State) ->
+    State;
+maybe_auto_resubscribe(#state{auto_subscribe = true,
+                               subscriptions = Subscriptions} = State) ->
+    case maps:size(Subscriptions) of
+        0 ->
+            State;
+        _ ->
+            SubList = [{Topic, SubOpts} || {Topic, SubOpts} <- maps:to_list(Subscriptions)],
+            PacketId = State#state.last_packet_id,
+            Via = default_via(State),
+            case send(Via, ?SUBSCRIBE_PACKET(PacketId, #{}, SubList), State) of
+                {ok, NewState} ->
+                    NewState#state{last_packet_id = next_packet_id(PacketId)};
+                {error, _Reason} ->
+                    State
+            end
+    end.

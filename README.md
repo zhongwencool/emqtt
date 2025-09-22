@@ -644,6 +644,10 @@ The maximum number of reconnection attempts. Defaults to 0, means no reconnectio
 
 The time interval between reconnection attempts. Defaults to 5s.
 
+`{auto_subscribe, boolean()}`
+
+Whether to automatically resubscribe to previously subscribed topics after reconnection. When enabled, the client will automatically send SUBSCRIBE packets for all previously subscribed topics after successfully reconnecting to the broker. Defaults to false.
+
 `{properties, Properties}`
 
 Properties of CONNECT packet.
