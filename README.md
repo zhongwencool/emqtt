@@ -660,17 +660,83 @@ See [Enhanced Authentication](#EnhancedAuthentication) below for more details.
 
 `{schedule_publish, Config}`
 
-Configure a built-in scheduler that periodically publishes messages after the client receives a successful CONNACK. `Config` is a map with the following keys:
+Configure one or more built-in schedulers that periodically publish messages after the client receives a successful CONNACK.
 
-- `enabled` (boolean, default `false`): turn the scheduler on.
-- `mfa` (fun/MFA, required when enabled): callback that returns the payload for each tick. It may return a `#mqtt_msg{}` record, `{Topic, Payload}`, `{Topic, Props, Payload, Opts}`, or `skip` to suppress the current tick.
-- `interval_ms` (positive integer, default `1000`): period between ticks in milliseconds.
-- `jitter_ms` (non-negative integer, default `0`): maximum start jitter applied once after connect.
-- `jitter_mode` (`uniform` | `fixed`, default `uniform`): `uniform` chooses a random delay between `0` and `jitter_ms`; `fixed` waits exactly `jitter_ms`.
-- `via` (via(), default `default`): publish over a specific transport path when using QUIC streams.
-- `timeout` (non-negative integer or `infinity`, default `infinity`): per-message timeout passed to `publish_async/7`.
+- `enabled` (boolean, default `false`): turn scheduling on. When `false`, no schedule definitions run.
+- `schedules` (list, default `[]`): a collection of independent schedule definitions. Each definition is a map that accepts the options below. The previous single-map form is still accepted and will be treated as a list with one entry.
+  - `mfa` (fun/MFA, required when the schedule should run): callback that returns the payload for each tick. It may return a `#mqtt_msg{}` record, `{Topic, Payload}`, `{Topic, Props, Payload, Opts}`, or `skip` to suppress the current tick.
+  - `interval_ms` (positive integer, default `1000`): period between ticks in milliseconds.
+  - `jitter_ms` (non-negative integer, default `0`): maximum start jitter applied once after connect.
+  - `jitter_mode` (`uniform` | `fixed`, default `uniform`): `uniform` chooses a random delay between `0` and `jitter_ms`; `fixed` waits exactly `jitter_ms`.
+  - `via` (via(), default `default`): publish over a specific transport path when using QUIC streams.
+  - `timeout` (non-negative integer or `infinity`, default `infinity`): per-message timeout passed to `publish_async/7`.
 
-The scheduler is cancelled automatically on disconnect/reconnect and restarted after the next successful connection.
+All configured schedules are cancelled automatically on disconnect/reconnect and restarted after the next successful connection when `enabled` is `true`.
+
+## Dynamic Schedule Management
+
+After establishing a connection, you can dynamically manage scheduled publishing using the following functions:
+
+**emqtt:schedule_add(Client, ScheduleConfig) -> {ok, ScheduleId} | {error, Reason}**
+
+**emqtt:schedule_add(Client, ScheduleConfig, Timeout) -> {ok, ScheduleId} | {error, Reason}**
+
+Add a new schedule dynamically. Returns a unique schedule ID for managing this specific schedule.
+
+- `ScheduleConfig`: A map with the same options as individual schedule entries (see above)
+- `Timeout`: Operation timeout in milliseconds (default: 5000)
+- `ScheduleId`: Unique integer identifier for the created schedule
+
+**emqtt:schedule_remove(Client, ScheduleId) -> ok | {error, Reason}**
+
+**emqtt:schedule_remove(Client, ScheduleId, Timeout) -> ok | {error, Reason}**
+
+Remove a specific schedule by its ID. The schedule will stop immediately.
+
+**emqtt:schedule_list(Client) -> {ok, [ScheduleInfo]} | {error, Reason}**
+
+**emqtt:schedule_list(Client, Timeout) -> {ok, [ScheduleInfo]} | {error, Reason}**
+
+List all currently active schedules. Each `ScheduleInfo` contains the schedule configuration with its ID.
+
+**emqtt:schedule_update(Client, ScheduleId, NewConfig) -> ok | {error, Reason}**
+
+**emqtt:schedule_update(Client, ScheduleId, NewConfig, Timeout) -> ok | {error, Reason}**
+
+Update an existing schedule with new configuration. The schedule is restarted with the new settings.
+
+Example usage:
+
+```erlang
+%% Start with empty schedules
+{ok, Client} = emqtt:start_link([{schedule_publish, #{enabled => true, schedules => []}}]),
+{ok, _} = emqtt:connect(Client),
+
+%% Add a dynamic schedule
+{ok, Id1} = emqtt:schedule_add(Client, #{
+    mfa => fun() -> {<<"sensor/temp">>, <<"22.5">>} end,
+    interval_ms => 5000
+}),
+
+%% Add another schedule
+{ok, Id2} = emqtt:schedule_add(Client, #{
+    mfa => {my_module, generate_data, []},
+    interval_ms => 10000,
+    jitter_ms => 1000
+}),
+
+%% List all schedules
+{ok, Schedules} = emqtt:schedule_list(Client),
+
+%% Update the first schedule
+ok = emqtt:schedule_update(Client, Id1, #{
+    mfa => fun() -> {<<"sensor/temp">>, <<"23.1">>} end,
+    interval_ms => 3000
+}),
+
+%% Remove the second schedule
+ok = emqtt:schedule_remove(Client, Id2).
+```
 
 **emqtt:connect(Client) -> {ok, Properties} | {error, Reason}**
 
