@@ -58,6 +58,13 @@
         , unsubscribe_via/4
         ]).
 
+%% Schedule Management
+-export([ schedule_add/3
+        , schedule_remove/2
+        , schedule_list/1
+        , schedule_update/3
+        ]).
+
 -export([ publish_async/4
         , publish_async/5
         , publish_async/6
@@ -133,15 +140,24 @@
 
 -type(mfas() :: {module(), atom(), list()} | {function(), list()}).
 
--type(schedule_publish_option() :: #{
-          enabled => boolean(),
-          mfa => mfas(),
+-type(schedule_publish_entry_option() :: #{
+          mfa := mfas(),
           interval_ms => pos_integer(),
           jitter_ms => non_neg_integer(),
           jitter_mode => uniform | fixed,
           via => via(),
           timeout => non_neg_integer() | infinity
          }).
+
+-type(schedule_publish_option() :: #{
+          enabled => boolean(),
+          schedules => [schedule_publish_entry_option()]
+         }).
+
+-type(schedule_add_result() :: {ok, schedule_id()} | {error, term()}).
+-type(schedule_remove_result() :: ok | {error, {not_found, schedule_id()} | term()}).
+-type(schedule_list_result() :: {ok, [schedule_entry_state()]} | {error, term()}).
+-type(schedule_update_result() :: ok | {error, {not_found, schedule_id()} | term()}).
 
 %% Message handler is a set of callbacks defined to handle MQTT messages
 %% as well as the disconnect event.
@@ -240,6 +256,18 @@
 
 -type reconnect() :: infinity | non_neg_integer().
 -type tref() :: reference().
+-type schedule_id() :: pos_integer().
+-type schedule_entry_state() :: #{
+          id := schedule_id(),
+          mfa := mfas(),
+          interval_ms := pos_integer(),
+          jitter_ms := non_neg_integer(),
+          jitter_mode := uniform | fixed,
+          via := via(),
+          timeout := non_neg_integer() | infinity,
+          start_timer := tref() | undefined,
+          tick_timer := tref() | undefined
+         }.
 
 -record(state, {
           name            :: atom(),
@@ -295,14 +323,8 @@
           extra = #{}     :: map(), %% extra field for easier to make appup
           telemetry_enabled :: boolean(),
           schedule_enabled :: boolean(),
-          schedule_mfa :: mfas() | undefined,
-          schedule_interval_ms :: pos_integer() | undefined,
-          schedule_jitter_ms :: non_neg_integer(),
-          schedule_jitter_mode :: uniform | fixed,
-          schedule_via :: via(),
-          schedule_timeout :: non_neg_integer() | infinity,
-          schedule_start_timer :: tref() | undefined,
-          schedule_tick_timer :: tref() | undefined
+          schedule_entries :: #{schedule_id() => schedule_entry_state()},
+          next_schedule_id :: schedule_id()
          }). %% note, always add the new fields at the tail for code_change.
 
 -type(state() ::  #state{}).
@@ -363,6 +385,8 @@
 -define(DEFAULT_ACK_TIMEOUT, 30000).
 -define(DEFAULT_CONNECT_TIMEOUT, 60000).
 -define(DEFAULT_RECONNECT_TIMEOUT, 5000).
+-define(MAX_SCHEDULES, 100).
+-define(MIN_SCHEDULE_INTERVAL, 100).
 
 -define(PROPERTY(Name, Val), #state{properties = #{Name := Val}}).
 
@@ -795,15 +819,9 @@ init([Options]) ->
                           last_packet_id  = 1,
                           pendings        = queue:new(),
                           telemetry_enabled = false,
-                          schedule_enabled = false,
-                          schedule_mfa = undefined,
-                          schedule_interval_ms = undefined,
-                          schedule_jitter_ms = 0,
-                          schedule_jitter_mode = uniform,
-                          schedule_via = default,
-                          schedule_timeout = infinity,
-                          schedule_start_timer = undefined,
-                          schedule_tick_timer = undefined
+                         schedule_enabled = false,
+                         schedule_entries = #{},
+                         next_schedule_id = 1
                          })),
     {ok, initialized, init_parse_state(State)}.
 
@@ -973,54 +991,112 @@ init([{custom_auth_callbacks, #{init := InitFn,
 init([_Opt | Opts], State) ->
     init(Opts, State).
 
-init_schedule_publish(Config, State) when is_map(Config) ->
+init_schedule_publish(Config, State = #state{schedule_entries = OldEntries}) when is_map(Config) ->
+    cancel_schedule_entries(OldEntries),
     Enabled = maps:get(enabled, Config, false),
-    case Enabled of
-        true ->
-            _ = cancel_timer(State#state.schedule_start_timer),
-            _ = cancel_timer(State#state.schedule_tick_timer),
-            MFA = get_required(mfa, Config),
-            ok = validate_schedule_mfa(MFA),
-            Interval = maps:get(interval_ms, Config, 1000),
-            ok = validate_positive_integer(interval_ms, Interval),
-            Jitter = maps:get(jitter_ms, Config, 0),
-            ok = validate_non_negative_integer(jitter_ms, Jitter),
-            Mode = maps:get(jitter_mode, Config, uniform),
-            ok = validate_jitter_mode(Mode),
-            Via = maps:get(via, Config, default),
-            Timeout = maps:get(timeout, Config, infinity),
-            ok = validate_timeout(Timeout),
+    SchedulesConfig = extract_schedule_configs(Config, Enabled),
+    Entries = build_schedule_entries(SchedulesConfig),
+    case {Enabled, map_size(Entries)} of
+        {true, 0} ->
+            erlang:error({invalid_schedule_publish_config, empty_schedules});
+        {false, _} ->
+            State#state{
+              schedule_enabled = false,
+              schedule_entries = #{},
+              next_schedule_id = 1
+             };
+        {true, _} ->
+            MaxId = case map_size(Entries) of
+                        0 -> 0;
+                        _ -> lists:max(maps:keys(Entries))
+                    end,
             State#state{
               schedule_enabled = true,
-              schedule_mfa = MFA,
-              schedule_interval_ms = Interval,
-              schedule_jitter_ms = Jitter,
-              schedule_jitter_mode = Mode,
-              schedule_via = Via,
-              schedule_timeout = Timeout,
-              schedule_start_timer = undefined,
-              schedule_tick_timer = undefined
-             };
-        false ->
-            init_schedule_publish_disabled(State)
+              schedule_entries = Entries,
+              next_schedule_id = MaxId + 1
+             }
     end;
 init_schedule_publish(_Other, _State) ->
     erlang:error({invalid_schedule_publish_config, not_a_map}).
 
-init_schedule_publish_disabled(State) ->
-    _ = cancel_timer(State#state.schedule_start_timer),
-    _ = cancel_timer(State#state.schedule_tick_timer),
-    State#state{
-      schedule_enabled = false,
-      schedule_mfa = undefined,
-      schedule_interval_ms = undefined,
-      schedule_jitter_ms = 0,
-      schedule_jitter_mode = uniform,
-      schedule_via = default,
-      schedule_timeout = infinity,
-      schedule_start_timer = undefined,
-      schedule_tick_timer = undefined
-     }.
+extract_schedule_configs(Config, Enabled) ->
+    case maps:find(schedules, Config) of
+        {ok, Schedules} ->
+            validate_top_level_keys(Config),
+            ensure_schedule_list(Schedules);
+        error ->
+            Schedule = maps:without([enabled], Config),
+            case {Enabled, map_size(Schedule)} of
+                {true, 0} ->
+                    erlang:error({invalid_schedule_publish_config, missing_schedule_definition});
+                {false, 0} ->
+                    [];
+                _ ->
+                    [Schedule]
+            end
+    end.
+
+validate_top_level_keys(Config) ->
+    case maps:without([enabled, schedules], Config) of
+        #{} -> ok;
+        Extra -> erlang:error({invalid_schedule_publish_config,
+                               {unsupported_top_level_keys, maps:keys(Extra)}})
+    end.
+
+ensure_schedule_list(Schedules) when is_list(Schedules) ->
+    [ensure_schedule_map(S) || S <- Schedules];
+ensure_schedule_list(Other) ->
+    erlang:error({invalid_schedule_publish_config, {invalid_schedules, Other}}).
+
+ensure_schedule_map(Map) when is_map(Map) -> Map;
+ensure_schedule_map(Other) ->
+    erlang:error({invalid_schedule_publish_config, {invalid_schedule, Other}}).
+
+build_schedule_entries([]) ->
+    #{};
+build_schedule_entries(Schedules) when length(Schedules) > ?MAX_SCHEDULES ->
+    erlang:error({too_many_schedules, length(Schedules), ?MAX_SCHEDULES});
+build_schedule_entries(Schedules) ->
+    {Entries, _} =
+        lists:foldl(
+          fun(Schedule, {Acc, Id}) ->
+                  Entry = build_schedule_entry(Id, Schedule),
+                  {Acc#{Id => Entry}, Id + 1}
+          end, {#{}, 1}, Schedules),
+    Entries.
+
+build_schedule_entry(Id, Schedule) when is_map(Schedule) ->
+    MFA = get_required(mfa, Schedule),
+    ok = validate_schedule_mfa(MFA),
+    Interval = maps:get(interval_ms, Schedule, 1000),
+    ok = validate_positive_integer(interval_ms, Interval),
+    case Interval < ?MIN_SCHEDULE_INTERVAL of
+        true -> erlang:error({invalid_interval_too_small, Interval, ?MIN_SCHEDULE_INTERVAL});
+        false -> ok
+    end,
+    Jitter = maps:get(jitter_ms, Schedule, 0),
+    ok = validate_non_negative_integer(jitter_ms, Jitter),
+    Mode = maps:get(jitter_mode, Schedule, uniform),
+    ok = validate_jitter_mode(Mode),
+    Via = maps:get(via, Schedule, default),
+    Timeout = maps:get(timeout, Schedule, infinity),
+    ok = validate_timeout(Timeout),
+    #{id => Id,
+      mfa => MFA,
+      interval_ms => Interval,
+      jitter_ms => Jitter,
+      jitter_mode => Mode,
+      via => Via,
+      timeout => Timeout,
+      start_timer => undefined,
+      tick_timer => undefined}.
+
+cancel_schedule_entries(Entries) ->
+    maps:foreach(fun(_, Entry) ->
+                         cancel_timer(maps:get(start_timer, Entry, undefined)),
+                         cancel_timer(maps:get(tick_timer, Entry, undefined))
+                 end, Entries),
+    ok.
 
 get_required(Key, Map) ->
     case maps:find(Key, Map) of
@@ -1546,23 +1622,27 @@ connected(cast, {?PACKET(?PINGRESP), Via}, State) ->
 connected(cast, {?DISCONNECT_PACKET(ReasonCode, Properties), _Via}, State) ->
     maybe_reconnect({disconnected, ReasonCode, Properties}, State);
 
-connected(info, {timeout, TRef, schedule_start},
-          #state{schedule_start_timer = TRef} = State0) ->
-    State1 = State0#state{schedule_start_timer = undefined},
-    State2 = schedule_fire_tick(State1),
-    {keep_state, ensure_schedule_tick_timer(State2)};
+connected(info, {timeout, TRef, {schedule_start, Id}}, State0) ->
+    case get_schedule_entry(State0, Id) of
+        {ok, Entry = #{start_timer := TRef}} ->
+            Entry1 = Entry#{start_timer := undefined},
+            State1 = put_schedule_entry(State0, Entry1),
+            State2 = schedule_fire_tick(State1, Id),
+            {keep_state, ensure_schedule_tick_timer(State2, Id)};
+        _ ->
+            {keep_state, State0}
+    end;
 
-connected(info, {timeout, _TRef, schedule_start}, State) ->
-    {keep_state, State};
-
-connected(info, {timeout, TRef, schedule_tick},
-          #state{schedule_tick_timer = TRef} = State0) ->
-    State1 = State0#state{schedule_tick_timer = undefined},
-    State2 = schedule_fire_tick(State1),
-    {keep_state, ensure_schedule_tick_timer(State2)};
-
-connected(info, {timeout, _TRef, schedule_tick}, State) ->
-    {keep_state, State};
+connected(info, {timeout, TRef, {schedule_tick, Id}}, State0) ->
+    case get_schedule_entry(State0, Id) of
+        {ok, Entry = #{tick_timer := TRef}} ->
+            Entry1 = Entry#{tick_timer := undefined},
+            State1 = put_schedule_entry(State0, Entry1),
+            State2 = schedule_fire_tick(State1, Id),
+            {keep_state, ensure_schedule_tick_timer(State2, Id)};
+        _ ->
+            {keep_state, State0}
+    end;
 
 connected(info, {timeout, _TRef, keepalive}, State = #state{force_ping = true, low_mem = IsLowMem}) ->
     case ensure_pingresp_received(State) of
@@ -1673,10 +1753,23 @@ handle_event({call, From}, stop, _StateName, _State) ->
 handle_event({call, From}, status, StateName, _State) ->
     {keep_state_and_data, {reply, From, StateName}};
 
-handle_event(info, {timeout, _TRef, schedule_start}, _StateName, State) ->
+%% Dynamic Schedule Management
+handle_event({call, From}, {schedule_add, ScheduleConfig}, _StateName, State) ->
+    handle_schedule_add(From, ScheduleConfig, State);
+
+handle_event({call, From}, {schedule_remove, ScheduleId}, _StateName, State) ->
+    handle_schedule_remove(From, ScheduleId, State);
+
+handle_event({call, From}, schedule_list, _StateName, State) ->
+    handle_schedule_list(From, State);
+
+handle_event({call, From}, {schedule_update, ScheduleId, NewConfig}, _StateName, State) ->
+    handle_schedule_update(From, ScheduleId, NewConfig, State);
+
+handle_event(info, {timeout, _TRef, {schedule_start, _Id}}, _StateName, State) ->
     {keep_state, State};
 
-handle_event(info, {timeout, _TRef, schedule_tick}, _StateName, State) ->
+handle_event(info, {timeout, _TRef, {schedule_tick, _Id}}, _StateName, State) ->
     {keep_state, State};
 
 handle_event(info, {gun_ws, ConnPid, StreamRef, {binary, Data}},
@@ -1843,8 +1936,7 @@ terminate(Reason, _StateName, State = #state{conn_mod = ConnMod, socket = Socket
     ok = reply_all_inflight_reqs(Reason1, State),
     ok = reply_all_pendings_reqs(Reason1, State),
     ok = eval_msg_handler(State, disconnected, Reason1),
-    ok = cancel_timer(State#state.schedule_start_timer),
-    ok = cancel_timer(State#state.schedule_tick_timer),
+    ok = cancel_schedule_entries(State#state.schedule_entries),
     ok = close_socket(ConnMod, Socket).
 
 %% Downgrade
@@ -2116,16 +2208,30 @@ ensure_keepalive_timer(I, State) when is_integer(I) ->
     State#state{keepalive_timer = erlang:start_timer(I, self(), keepalive)}.
 
 maybe_start_schedule_timer(State = #state{schedule_enabled = true,
-                                          schedule_start_timer = undefined,
-                                          schedule_interval_ms = Interval,
-                                          schedule_jitter_ms = Jitter,
-                                          schedule_jitter_mode = Mode})
-  when is_integer(Interval), Interval > 0, is_integer(Jitter), Jitter >= 0 ->
-    Delay = schedule_initial_delay(Jitter, Mode),
-    TRef = erlang:start_timer(Delay, self(), schedule_start),
-    State#state{schedule_start_timer = TRef};
+                                          schedule_entries = Entries})
+  when map_size(Entries) > 0 ->
+    Entries1 = maps:map(fun(Id, Entry) ->
+                                maybe_start_schedule_entry_timer(Id, Entry)
+                        end, Entries),
+    State#state{schedule_entries = Entries1};
 maybe_start_schedule_timer(State) ->
     State.
+
+maybe_start_schedule_entry_timer(Id, Entry0) ->
+    StartTimer = maps:get(start_timer, Entry0),
+    TickTimer = maps:get(tick_timer, Entry0),
+    case {StartTimer, TickTimer} of
+        {_Start, Tick} when Tick =/= undefined ->
+            Entry0;
+        {Start, _Tick} when Start =/= undefined ->
+            Entry0;
+        _ ->
+            Jitter = maps:get(jitter_ms, Entry0),
+            Mode = maps:get(jitter_mode, Entry0),
+            Delay = schedule_initial_delay(Jitter, Mode),
+            TRef = erlang:start_timer(Delay, self(), {schedule_start, Id}),
+            Entry0#{start_timer := TRef}
+    end.
 
 schedule_initial_delay(Jitter, fixed) when Jitter =< 0 -> 0;
 schedule_initial_delay(Jitter, fixed) -> Jitter;
@@ -2135,26 +2241,39 @@ schedule_initial_delay(Jitter, uniform) when Jitter > 0 ->
     rand:uniform(Jitter + 1) - 1;
 schedule_initial_delay(_, _) -> 0.
 
-ensure_schedule_tick_timer(State = #state{schedule_enabled = true,
-                                          schedule_interval_ms = Interval})
-  when is_integer(Interval), Interval > 0 ->
-    TRef = erlang:start_timer(Interval, self(), schedule_tick),
-    State#state{schedule_tick_timer = TRef};
-ensure_schedule_tick_timer(State) ->
+ensure_schedule_tick_timer(State = #state{schedule_enabled = true}, Id) ->
+    case get_schedule_entry(State, Id) of
+        {ok, Entry = #{interval_ms := Interval}} when is_integer(Interval), Interval > 0 ->
+            case maps:get(tick_timer, Entry, undefined) of
+                undefined ->
+                    TRef = erlang:start_timer(Interval, self(), {schedule_tick, Id}),
+                    put_schedule_entry(State, Entry#{tick_timer := TRef});
+                _ -> State
+            end;
+        _ -> State
+    end;
+ensure_schedule_tick_timer(State, _Id) ->
     State.
 
-schedule_fire_tick(State = #state{schedule_enabled = true,
-                                  schedule_mfa = MFA}) when MFA =/= undefined ->
-    case schedule_safe_apply_mfa(MFA) of
-        skip ->
-            State;
-        {error, Reason, Stack} ->
-            ?LOG(error, "schedule_publish_mfa_failed", #{reason => Reason, stacktrace => Stack}, State),
-            State;
-        {ok, Value} ->
-            schedule_dispatch(Value, State)
+schedule_fire_tick(State = #state{schedule_enabled = true}, Id) ->
+    case get_schedule_entry(State, Id) of
+        {ok, Entry = #{mfa := MFA}} when MFA =/= undefined ->
+            case schedule_safe_apply_mfa(MFA) of
+                skip ->
+                    State;
+                {error, Reason, Stack} ->
+                    MFADesc = format_mfa_description(MFA),
+                    ?LOG(error, "schedule_publish_mfa_failed",
+                         #{reason => Reason, stacktrace => Stack, schedule_id => Id,
+                           mfa_description => MFADesc, interval_ms => maps:get(interval_ms, Entry)}, State),
+                    State;
+                {ok, Value} ->
+                    schedule_dispatch(Value, Entry, State)
+            end;
+        _ ->
+            State
     end;
-schedule_fire_tick(State) ->
+schedule_fire_tick(State, _Id) ->
     State.
 
 schedule_safe_apply_mfa(MFA) ->
@@ -2184,41 +2303,93 @@ apply_schedule_mfa(F) when is_function(F) ->
     end.
 
 schedule_dispatch(#mqtt_msg{} = Msg,
-                  State = #state{schedule_via = Via,
-                                 schedule_timeout = Timeout}) ->
+                  Entry,
+                  State) ->
+    Via = maps:get(via, Entry),
+    Timeout = maps:get(timeout, Entry),
     _ = publish_async(self(), Via, Msg, Timeout, ?NO_HANDLER),
     State;
 schedule_dispatch({Topic, Payload},
-                  State = #state{schedule_via = Via,
-                                 schedule_timeout = Timeout}) ->
+                  Entry,
+                  State) ->
     try
         BinTopic = iolist_to_binary(Topic),
+        Via = maps:get(via, Entry),
+        Timeout = maps:get(timeout, Entry),
         _ = publish_async(self(), Via, BinTopic, #{}, Payload, [{qos, ?QOS_0}], Timeout, ?NO_HANDLER),
         State
     catch
         Class:Reason:Stacktrace ->
             ?LOG(error, "schedule_publish_invalid_return",
-                 #{reason => {Class, Reason}, stacktrace => Stacktrace, value => {Topic, Payload}}, State),
+                 #{reason => {Class, Reason},
+                   stacktrace => Stacktrace,
+                   value => {Topic, Payload},
+                   schedule_id => maps:get(id, Entry)},
+                 State),
             State
     end;
 schedule_dispatch({Topic, Props, Payload, Opts},
-                  State = #state{schedule_via = Via,
-                                 schedule_timeout = Timeout})
+                  Entry,
+                  State)
   when is_map(Props), is_list(Opts) ->
     try
         BinTopic = iolist_to_binary(Topic),
+        Via = maps:get(via, Entry),
+        Timeout = maps:get(timeout, Entry),
         _ = publish_async(self(), Via, BinTopic, Props, Payload, Opts, Timeout, ?NO_HANDLER),
         State
     catch
         Class:Reason:Stacktrace ->
             ?LOG(error, "schedule_publish_invalid_return",
                  #{reason => {Class, Reason}, stacktrace => Stacktrace,
-                   value => {Topic, Props, Payload, Opts}}, State),
+                   value => {Topic, Props, Payload, Opts},
+                   schedule_id => maps:get(id, Entry)},
+                 State),
             State
     end;
-schedule_dispatch(Other, State) ->
-    ?LOG(error, "schedule_publish_invalid_return", #{value => Other}, State),
+schedule_dispatch(Other, Entry, State) ->
+    MFADesc = format_mfa_description(maps:get(mfa, Entry)),
+    ?LOG(error, "schedule_publish_invalid_return",
+         #{value => Other, schedule_id => maps:get(id, Entry),
+           mfa_description => MFADesc, interval_ms => maps:get(interval_ms, Entry)}, State),
     State.
+
+get_schedule_entry(#state{schedule_entries = Entries}, Id) ->
+    maps:find(Id, Entries).
+
+put_schedule_entry(State = #state{schedule_entries = Entries}, Entry) ->
+    Id = maps:get(id, Entry),
+    State#state{schedule_entries = Entries#{Id => Entry}}.
+
+%% Dynamic Schedule Management API
+
+-spec schedule_add(pid(), schedule_publish_entry_option(), pos_integer()) -> schedule_add_result().
+schedule_add(Client, ScheduleConfig, Timeout) when is_map(ScheduleConfig) ->
+    gen_statem:call(Client, {schedule_add, ScheduleConfig}, Timeout).
+
+-spec schedule_remove(pid(), schedule_id()) -> schedule_remove_result().
+schedule_remove(Client, ScheduleId) ->
+    schedule_remove(Client, ScheduleId, 5000).
+
+-spec schedule_remove(pid(), schedule_id(), pos_integer()) -> schedule_remove_result().
+schedule_remove(Client, ScheduleId, Timeout) ->
+    gen_statem:call(Client, {schedule_remove, ScheduleId}, Timeout).
+
+-spec schedule_list(pid()) -> schedule_list_result().
+schedule_list(Client) ->
+    schedule_list(Client, 5000).
+
+-spec schedule_list(pid(), pos_integer()) -> schedule_list_result().
+schedule_list(Client, Timeout) ->
+    gen_statem:call(Client, schedule_list, Timeout).
+
+-spec schedule_update(pid(), schedule_id(), schedule_publish_entry_option()) -> schedule_update_result().
+schedule_update(Client, ScheduleId, NewConfig) ->
+    schedule_update(Client, ScheduleId, NewConfig, 5000).
+
+-spec schedule_update(pid(), schedule_id(), schedule_publish_entry_option(), pos_integer()) -> schedule_update_result().
+schedule_update(Client, ScheduleId, NewConfig, Timeout) when is_map(NewConfig) ->
+    gen_statem:call(Client, {schedule_update, ScheduleId, NewConfig}, Timeout).
 
 new_call(Id, From) ->
     new_call(Id, From, undefined).
@@ -2623,8 +2794,7 @@ prepare_reconnect(#state{
         keepalive_timer = KeepAliveTimer,
         sock_opts = OldSockOpts,
         ack_timer = AckTimer,
-        schedule_start_timer = ScheduleStartTimer,
-        schedule_tick_timer = ScheduleTickTimer,
+        schedule_entries = Entries,
         socket = OldSocket,
         conn_mod = ConnMod
     } = State) ->
@@ -2632,15 +2802,17 @@ prepare_reconnect(#state{
     ok = cancel_timer(RetryTimer),
     ok = cancel_timer(KeepAliveTimer),
     ok = cancel_timer(AckTimer),
-    ok = cancel_timer(ScheduleStartTimer),
-    ok = cancel_timer(ScheduleTickTimer),
+    ok = cancel_schedule_entries(Entries),
     State1 = update_for_reconnecting(State),
+    Entries1 = maps:map(fun(_, Entry) ->
+                                Entry#{start_timer := undefined,
+                                       tick_timer := undefined}
+                        end, Entries),
     State1#state{
         sock_opts = proplists:delete(handle, OldSockOpts),
         retry_timer = undefined,
         keepalive_timer = undefined,
-        schedule_start_timer = undefined,
-        schedule_tick_timer = undefined
+        schedule_entries = Entries1
     }.
 
 next_retry_cnt(infinity) -> infinity;
@@ -2897,3 +3069,80 @@ maybe_auto_resubscribe(#state{auto_subscribe = true,
                     State
             end
     end.
+
+%% Dynamic Schedule Management Implementation
+
+handle_schedule_add(From, _ScheduleConfig, #state{schedule_enabled = false}) ->
+    {keep_state_and_data, {reply, From, {error, schedule_disabled}}};
+handle_schedule_add(From, ScheduleConfig, State = #state{schedule_entries = Entries,
+                                                        next_schedule_id = NextId}) ->
+    try
+        case map_size(Entries) >= ?MAX_SCHEDULES of
+            true ->
+                {keep_state_and_data, {reply, From, {error, {too_many_schedules, ?MAX_SCHEDULES}}}};
+            false ->
+                Entry = build_schedule_entry(NextId, ScheduleConfig),
+                Entry1 = maybe_start_schedule_entry_timer(NextId, Entry),
+                NewEntries = Entries#{NextId => Entry1},
+                NewState = State#state{schedule_entries = NewEntries,
+                                     next_schedule_id = NextId + 1},
+                {keep_state, NewState, {reply, From, {ok, NextId}}}
+        end
+    catch
+        error:Reason ->
+            {keep_state_and_data, {reply, From, {error, Reason}}}
+    end.
+
+handle_schedule_remove(From, ScheduleId, State = #state{schedule_entries = Entries}) ->
+    case maps:find(ScheduleId, Entries) of
+        {ok, Entry} ->
+            cancel_timer(maps:get(start_timer, Entry, undefined)),
+            cancel_timer(maps:get(tick_timer, Entry, undefined)),
+            NewEntries = maps:remove(ScheduleId, Entries),
+            NewState = State#state{schedule_entries = NewEntries},
+            {keep_state, NewState, {reply, From, ok}};
+        error ->
+            {keep_state_and_data, {reply, From, {error, {not_found, ScheduleId}}}}
+    end.
+
+handle_schedule_list(From, #state{schedule_entries = Entries}) ->
+    ScheduleList = [maps:without([start_timer, tick_timer], Entry) || Entry <- maps:values(Entries)],
+    {keep_state_and_data, {reply, From, {ok, ScheduleList}}}.
+
+handle_schedule_update(From, ScheduleId, NewConfig, State = #state{schedule_entries = Entries}) ->
+    case maps:find(ScheduleId, Entries) of
+        {ok, OldEntry} ->
+            try
+                % Cancel existing timers
+                cancel_timer(maps:get(start_timer, OldEntry, undefined)),
+                cancel_timer(maps:get(tick_timer, OldEntry, undefined)),
+
+                % Build new entry with same ID but updated config
+                NewEntry = build_schedule_entry(ScheduleId, NewConfig),
+                NewEntry1 = maybe_start_schedule_entry_timer(ScheduleId, NewEntry),
+
+                NewEntries = Entries#{ScheduleId => NewEntry1},
+                NewState = State#state{schedule_entries = NewEntries},
+                {keep_state, NewState, {reply, From, ok}}
+            catch
+                error:Reason ->
+                    {keep_state_and_data, {reply, From, {error, Reason}}}
+            end;
+        error ->
+            {keep_state_and_data, {reply, From, {error, {not_found, ScheduleId}}}}
+    end.
+
+format_mfa_description({M, F, A}) when is_atom(M), is_atom(F), is_list(A) ->
+    io_lib:format("~p:~p/~p", [M, F, length(A)]);
+format_mfa_description({F, A}) when is_function(F), is_list(A) ->
+    {module, Module} = erlang:fun_info(F, module),
+    {name, Name} = erlang:fun_info(F, name),
+    {arity, Arity} = erlang:fun_info(F, arity),
+    io_lib:format("~p:~p/~p", [Module, Name, Arity]);
+format_mfa_description(F) when is_function(F) ->
+    {module, Module} = erlang:fun_info(F, module),
+    {name, Name} = erlang:fun_info(F, name),
+    {arity, Arity} = erlang:fun_info(F, arity),
+    io_lib:format("~p:~p/~p", [Module, Name, Arity]);
+format_mfa_description(Other) ->
+    io_lib:format("~p", [Other]).
