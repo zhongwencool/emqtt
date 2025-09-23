@@ -1340,16 +1340,6 @@ waiting_for_connack({call, _From}, Event, _State) when Event =/= stop ->
 waiting_for_connack(info, ?PUB_REQ(_Msg, _Via, _ExpireAt, _Callback), _State) ->
     {keep_state_and_data, postpone};
 
-waiting_for_connack(info, {gun_ws, _Pid, _Ref, {binary, _Data}}, _State) ->
-    {keep_state_and_data, postpone};
-waiting_for_connack(info, {gun_ws, _Pid, _Ref, {close, Code, Reason}}, State) ->
-    case take_call(call_id(connect, default_via(State)), State) of
-        {value, #call{from = From}, _State} ->
-            shutdown_reply(connack_error, From, {error, Code, Reason});
-        false ->
-            maybe_reconnect(connack_error, State)
-    end;
-
 waiting_for_connack(state_timeout, connack_timeout, State) ->
     case take_call(call_id(connect, default_via(State)), State) of
         {value, #call{from = From}, _State} ->
