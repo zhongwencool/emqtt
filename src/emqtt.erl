@@ -997,8 +997,6 @@ init_schedule_publish(Config, State = #state{schedule_entries = OldEntries}) whe
     SchedulesConfig = extract_schedule_configs(Config, Enabled),
     Entries = build_schedule_entries(SchedulesConfig),
     case {Enabled, map_size(Entries)} of
-        {true, 0} ->
-            erlang:error({invalid_schedule_publish_config, empty_schedules});
         {false, _} ->
             State#state{
               schedule_enabled = false,
