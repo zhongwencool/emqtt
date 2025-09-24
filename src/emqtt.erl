@@ -1790,6 +1790,26 @@ handle_event(info, {gun_down, ConnPid, _, Reason, _KilledStreams},
     ?LOG(debug, "websocket_down", #{reason => Reason}, State),
     maybe_reconnect({websocket_down, Reason}, State);
 
+%% Handle gun_ws close events that don't match the strict socket pattern
+handle_event(info, {gun_ws, ConnPid, _StreamRef, {close, Code, _}},
+             _StateName, State) when is_pid(ConnPid) ->
+    %% WebSocket close is phase 1 of 2-phase shutdown protocol.
+    %% Don't reconnect here - wait for gun_down event which indicates
+    %% complete connection termination and resource cleanup.
+    %% This prevents race conditions and duplicate reconnection attempts.
+    ?LOG(debug, "websocket_close_general", #{pid => ConnPid, code => Code}, State),
+    keep_state_and_data;
+
+%% Handle gun_down events that don't match the strict socket pattern
+handle_event(info, {gun_down, ConnPid, _, Reason, _KilledStreams},
+             _StateName, State) when is_pid(ConnPid) ->
+    %% Handle any gun_down event, even if socket state doesn't match
+    ?LOG(debug, "websocket_down_general", #{pid => ConnPid, reason => Reason}, State),
+    case State#state.socket of
+        {ConnPid, _} -> maybe_reconnect({websocket_down, Reason}, State);
+        _ -> keep_state_and_data  %% Not current connection, ignore safely
+    end;
+
 handle_event(info, {ssl, session_ticket, _Ticket}, _StateName, _State) ->
     %% TLS 1.3 session ticket
     keep_state_and_data;
