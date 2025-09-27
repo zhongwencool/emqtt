@@ -1625,8 +1625,7 @@ connected(info, {timeout, TRef, {schedule_start, Id}}, State0) ->
         {ok, Entry = #{start_timer := TRef}} ->
             Entry1 = Entry#{start_timer := undefined},
             State1 = put_schedule_entry(State0, Entry1),
-            State2 = schedule_fire_tick(State1, Id),
-            {keep_state, ensure_schedule_tick_timer(State2, Id)};
+            schedule_tick_result(schedule_fire_tick(State1, Id), Id);
         _ ->
             {keep_state, State0}
     end;
@@ -1636,8 +1635,7 @@ connected(info, {timeout, TRef, {schedule_tick, Id}}, State0) ->
         {ok, Entry = #{tick_timer := TRef}} ->
             Entry1 = Entry#{tick_timer := undefined},
             State1 = put_schedule_entry(State0, Entry1),
-            State2 = schedule_fire_tick(State1, Id),
-            {keep_state, ensure_schedule_tick_timer(State2, Id)};
+            schedule_tick_result(schedule_fire_tick(State1, Id), Id);
         _ ->
             {keep_state, State0}
     end;
@@ -2278,21 +2276,32 @@ schedule_fire_tick(State = #state{schedule_enabled = true}, Id) ->
         {ok, Entry = #{mfa := MFA}} when MFA =/= undefined ->
             case schedule_safe_apply_mfa(MFA) of
                 skip ->
-                    State;
+                    {keep_state, State};
                 {error, Reason, Stack} ->
                     MFADesc = format_mfa_description(MFA),
                     ?LOG(error, "schedule_publish_mfa_failed",
                          #{reason => Reason, stacktrace => Stack, schedule_id => Id,
                            mfa_description => MFADesc, interval_ms => maps:get(interval_ms, Entry)}, State),
-                    State;
+                    {keep_state, State};
                 {ok, Value} ->
                     schedule_dispatch(Value, Entry, State)
             end;
         _ ->
-            State
+            {keep_state, State}
     end;
 schedule_fire_tick(State, _Id) ->
-    State.
+    {keep_state, State}.
+
+schedule_tick_result({keep_state, NewState}, Id) ->
+    {keep_state, ensure_schedule_tick_timer(NewState, Id)};
+schedule_tick_result({keep_state, NewState, Actions}, Id) ->
+    {keep_state, ensure_schedule_tick_timer(NewState, Id), Actions};
+schedule_tick_result({next_state, StateName, NewState}, Id) ->
+    {next_state, StateName, ensure_schedule_tick_timer(NewState, Id)};
+schedule_tick_result({next_state, StateName, NewState, Actions}, Id) ->
+    {next_state, StateName, ensure_schedule_tick_timer(NewState, Id), Actions};
+schedule_tick_result(Result, _Id) ->
+    Result.
 
 schedule_safe_apply_mfa(MFA) ->
     try
@@ -2330,11 +2339,7 @@ schedule_dispatch(#mqtt_msg{} = Msg,
                    _ -> erlang:system_time(millisecond) + Timeout
                end,
     PubReq = ?PUB_REQ(Msg, Via, ExpireAt, ?NO_HANDLER),
-    case shoot(PubReq, State) of
-        {keep_state, NewState} -> NewState;
-        {next_state, _StateName, NewState} -> NewState;
-        NewState when is_record(NewState, state) -> NewState
-    end;
+    normalize_shoot_result(shoot(PubReq, State));
 schedule_dispatch({Topic, Payload},
                   Entry,
                   State) ->
@@ -2352,11 +2357,7 @@ schedule_dispatch({Topic, Payload},
                         props = #{},
                         payload = Payload},
         PubReq = ?PUB_REQ(Msg, Via, ExpireAt, ?NO_HANDLER),
-        case shoot(PubReq, State) of
-            {keep_state, NewState} -> NewState;
-            {next_state, _StateName, NewState} -> NewState;
-            NewState when is_record(NewState, state) -> NewState
-        end
+        normalize_shoot_result(shoot(PubReq, State))
     catch
         Class:Reason:Stacktrace ->
             ?LOG(error, "schedule_publish_invalid_return",
@@ -2365,7 +2366,7 @@ schedule_dispatch({Topic, Payload},
                    value => {Topic, Payload},
                    schedule_id => maps:get(id, Entry)},
                  State),
-            State
+            {keep_state, State}
     end;
 schedule_dispatch({Topic, Props, Payload, Opts},
                   Entry,
@@ -2388,11 +2389,7 @@ schedule_dispatch({Topic, Props, Payload, Opts},
                         props = Props,
                         payload = Payload},
         PubReq = ?PUB_REQ(Msg, Via, ExpireAt, ?NO_HANDLER),
-        case shoot(PubReq, State) of
-            {keep_state, NewState} -> NewState;
-            {next_state, _StateName, NewState} -> NewState;
-            NewState when is_record(NewState, state) -> NewState
-        end
+        normalize_shoot_result(shoot(PubReq, State))
     catch
         Class:Reason:Stacktrace ->
             ?LOG(error, "schedule_publish_invalid_return",
@@ -2400,14 +2397,41 @@ schedule_dispatch({Topic, Props, Payload, Opts},
                    value => {Topic, Props, Payload, Opts},
                    schedule_id => maps:get(id, Entry)},
                  State),
-            State
+            {keep_state, State}
     end;
 schedule_dispatch(Other, Entry, State) ->
     MFADesc = format_mfa_description(maps:get(mfa, Entry)),
     ?LOG(error, "schedule_publish_invalid_return",
          #{value => Other, schedule_id => maps:get(id, Entry),
            mfa_description => MFADesc, interval_ms => maps:get(interval_ms, Entry)}, State),
-    State.
+    {keep_state, State}.
+
+normalize_shoot_result({keep_state, _State} = Result) ->
+    Result;
+normalize_shoot_result({keep_state, _State, _Actions} = Result) ->
+    Result;
+normalize_shoot_result({next_state, _StateName, _State} = Result) ->
+    Result;
+normalize_shoot_result({next_state, _StateName, _State, _Actions} = Result) ->
+    Result;
+normalize_shoot_result({repeat_state, _State} = Result) ->
+    Result;
+normalize_shoot_result({repeat_state, _State, _Actions} = Result) ->
+    Result;
+normalize_shoot_result({stop, _Reason, _State} = Result) ->
+    Result;
+normalize_shoot_result({stop, _Reason, _State, _Actions} = Result) ->
+    Result;
+normalize_shoot_result({stop_and_reply, _Reason, _Replies} = Result) ->
+    Result;
+normalize_shoot_result({stop_and_reply, _Reason, _Replies, _State} = Result) ->
+    Result;
+normalize_shoot_result({stop_and_reply, _Reason, _Replies, _State, _Actions} = Result) ->
+    Result;
+normalize_shoot_result(State) when is_record(State, state) ->
+    {keep_state, State};
+normalize_shoot_result(Result) ->
+    Result.
 
 get_schedule_entry(#state{schedule_entries = Entries}, Id) ->
     maps:find(Id, Entries).
