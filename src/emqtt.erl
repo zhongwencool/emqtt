@@ -2368,7 +2368,7 @@ schedule_dispatch({Topic, Payload},
                  State),
             {keep_state, State}
     end;
-schedule_dispatch({Topic, Props, Payload, Opts},
+schedule_dispatch({Topic, Props, Payload, Opts, Callback},
                   Entry,
                   State)
   when is_map(Props), is_list(Opts) ->
@@ -2388,7 +2388,7 @@ schedule_dispatch({Topic, Props, Payload, Opts},
                         topic = BinTopic,
                         props = Props,
                         payload = Payload},
-        PubReq = ?PUB_REQ(Msg, Via, ExpireAt, ?NO_HANDLER),
+        PubReq = ?PUB_REQ(Msg, Via, ExpireAt, Callback),
         normalize_shoot_result(shoot(PubReq, State))
     catch
         Class:Reason:Stacktrace ->
