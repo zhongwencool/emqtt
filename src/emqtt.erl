@@ -2325,8 +2325,16 @@ schedule_dispatch(#mqtt_msg{} = Msg,
                   State) ->
     Via = maps:get(via, Entry),
     Timeout = maps:get(timeout, Entry),
-    _ = publish_async(self(), Via, Msg, Timeout, ?NO_HANDLER),
-    State;
+    ExpireAt = case Timeout of
+                   infinity -> infinity;
+                   _ -> erlang:system_time(millisecond) + Timeout
+               end,
+    PubReq = ?PUB_REQ(Msg, Via, ExpireAt, ?NO_HANDLER),
+    case shoot(PubReq, State) of
+        {keep_state, NewState} -> NewState;
+        {next_state, _StateName, NewState} -> NewState;
+        NewState when is_record(NewState, state) -> NewState
+    end;
 schedule_dispatch({Topic, Payload},
                   Entry,
                   State) ->
@@ -2334,8 +2342,21 @@ schedule_dispatch({Topic, Payload},
         BinTopic = iolist_to_binary(Topic),
         Via = maps:get(via, Entry),
         Timeout = maps:get(timeout, Entry),
-        _ = publish_async(self(), Via, BinTopic, #{}, Payload, [{qos, ?QOS_0}], Timeout, ?NO_HANDLER),
-        State
+        ExpireAt = case Timeout of
+                       infinity -> infinity;
+                       _ -> erlang:system_time(millisecond) + Timeout
+                   end,
+        Msg = #mqtt_msg{qos = ?QOS_0,
+                        retain = false,
+                        topic = BinTopic,
+                        props = #{},
+                        payload = Payload},
+        PubReq = ?PUB_REQ(Msg, Via, ExpireAt, ?NO_HANDLER),
+        case shoot(PubReq, State) of
+            {keep_state, NewState} -> NewState;
+            {next_state, _StateName, NewState} -> NewState;
+            NewState when is_record(NewState, state) -> NewState
+        end
     catch
         Class:Reason:Stacktrace ->
             ?LOG(error, "schedule_publish_invalid_return",
@@ -2354,8 +2375,24 @@ schedule_dispatch({Topic, Props, Payload, Opts},
         BinTopic = iolist_to_binary(Topic),
         Via = maps:get(via, Entry),
         Timeout = maps:get(timeout, Entry),
-        _ = publish_async(self(), Via, BinTopic, Props, Payload, Opts, Timeout, ?NO_HANDLER),
-        State
+        ExpireAt = case Timeout of
+                       infinity -> infinity;
+                       _ -> erlang:system_time(millisecond) + Timeout
+                   end,
+        ok = emqtt_props:validate(Props),
+        Retain = proplists:get_bool(retain, Opts),
+        QoS = qos_number(proplists:get_value(qos, Opts, ?QOS_0)),
+        Msg = #mqtt_msg{qos = QoS,
+                        retain = Retain,
+                        topic = BinTopic,
+                        props = Props,
+                        payload = Payload},
+        PubReq = ?PUB_REQ(Msg, Via, ExpireAt, ?NO_HANDLER),
+        case shoot(PubReq, State) of
+            {keep_state, NewState} -> NewState;
+            {next_state, _StateName, NewState} -> NewState;
+            NewState when is_record(NewState, state) -> NewState
+        end
     catch
         Class:Reason:Stacktrace ->
             ?LOG(error, "schedule_publish_invalid_return",
