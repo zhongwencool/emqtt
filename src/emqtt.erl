@@ -2942,9 +2942,11 @@ maybe_init_quic_state(emqtt_quic, State) ->
 maybe_init_quic_state(_, Old) ->
     Old.
 
-do_init_quic_state(#state{extra = Extra, clientid = Cid,
-                          reconnect = Re, parse_state = PS} = Old) ->
+do_init_quic_state(#state{extra = Extra, clientid = Cid, broker_name = BrokerName,
+                          proto_ver = ProtoVer, reconnect = Re, parse_state = PS} = Old) ->
     Old#state{extra = emqtt_quic:init_state(Extra#{ clientid => Cid
+                                                  , broker_name => BrokerName
+                                                  , protocol_version => ProtoVer
                                                   , conn_parse_state => PS %% set once
                                                   , data_stream_socks => []
                                                   , logic_stream_map => #{}

@@ -48,6 +48,8 @@
              ]).
 
 -type cb_data() :: #{ clientid := binary()
+                    , broker_name => binary()
+                    , protocol_version => atom()
                     , connection_parse_state := emqtt_frame:parse_state()
                     , stream_parse_state := #{ quic_sock() => emqtt_frame:parse_state() }
                     , data_stream_socks := [quic_sock()]
