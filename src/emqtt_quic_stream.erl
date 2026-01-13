@@ -122,6 +122,7 @@ handle_stream_data(Stream, Bin, _Flags, #{ is_local := true
         PS ->
             case parse(Bin, PS, []) of
                 {keep_state, NewPS, Packets} ->
+                    emit_recv_packet_telemetry(Packets, Bin, S),
                     {keep_state, S#{stream_parse_state := maps:update(Via, NewPS, PSS)},
                      [{next_event, cast, {P, Via} }
                       || P <- lists:reverse(Packets)]};
@@ -196,6 +197,31 @@ parse(Bin, PS, Packets) ->
         error:Error:ST ->
             {stop, {Error, ST}}
     end.
+
+emit_recv_packet_telemetry([], _Bin, _S) ->
+    ok;
+emit_recv_packet_telemetry(Packets, Bin, #{clientid := ClientId} = S)
+  when is_list(Packets), is_binary(Bin) ->
+    Measurements = #{data_size => byte_size(Bin)},
+    BaseMetadata = #{
+        client_id => ClientId,
+        broker_name => maps:get(broker_name, S, undefined),
+        socket_type => quic,
+        connection_module => emqtt_quic,
+        protocol_version => maps:get(protocol_version, S, undefined),
+        pid => self()
+    },
+    lists:foreach(
+      fun(Packet) ->
+              telemetry:execute([emqtt, socket, recv_packet],
+                                Measurements,
+                                BaseMetadata#{packet => Packet})
+      end,
+      lists:reverse(Packets)
+     ),
+    ok;
+emit_recv_packet_telemetry(_Packets, _Bin, _S) ->
+    ok.
 
 -else.
 %% BUILD_WITHOUT_QUIC
